@@ -1,0 +1,259 @@
+import math
+import os
+import shutil
+from collections import OrderedDict, deque
+from html import escape
+import re
+
+import commonmark
+from feedgen.feed import FeedGenerator
+from jinja2 import Template
+
+from .db import Message
+
+
+class TelegramFormatter:
+    BOLD = re.compile(r"\*(.*?)\*")
+    ITALIC = re.compile(r"_(.*?)_")
+    STRIKE = re.compile(r"~(.*?)~")
+    UNDERLINE = re.compile(r"__(.*?)__")
+    INLINE_CODE = re.compile(r"`([^`]+)`")
+
+    def convert(self, text: str) -> str:
+        if not text:
+            return ""
+        text = escape(text)
+        text = self.UNDERLINE.sub(r"<u>\1</u>", text)
+        text = self.BOLD.sub(r"**\1**", text)
+        text = self.ITALIC.sub(r"*\1*", text)
+        text = self.STRIKE.sub(r"~~\1~~", text)
+        text = self.INLINE_CODE.sub(r"`\1`", text)
+        return text
+
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ config.site_name }}</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h1>{{ config.site_name }}</h1>
+  {% for year, months in timeline.items() %}
+    <h2>{{ year }}</h2>
+    <ul>
+    {% for m in months %}
+      <li>
+        <a href="{{ make_filename(m, 1) }}">
+          {{ m.slug }}
+        </a>
+      </li>
+    {% endfor %}
+    </ul>
+  {% endfor %}
+</aside>
+
+<main class="content">
+{% for m in messages %}
+<article id="{{ m.id }}">
+  <header>
+    <strong>@{{ m.user.username }}</strong>
+    <time>{{ m.date }}</time>
+  </header>
+
+  <div>
+    {{ render(m.content) | safe }}
+  </div>
+
+  {% if m.reply_to and page_ids.get(m.reply_to) %}
+    <div>
+      回复：
+      <a href="{{ page_ids.get(m.reply_to) }}#{{ m.reply_to }}">
+        #{{ m.reply_to }}
+      </a>
+    </div>
+  {% endif %}
+</article>
+{% endfor %}
+</main>
+
+</body>
+</html>
+"""
+
+
+STYLE_CSS = """
+body {
+  margin: 0;
+  display: flex;
+  font-family: system-ui;
+}
+.sidebar {
+  width: 260px;
+  padding: 20px;
+  background: #161b22;
+  color: #c9d1d9;
+}
+.content {
+  flex: 1;
+  padding: 30px;
+}
+article {
+  margin-bottom: 20px;
+}
+"""
+
+
+class Build:
+    def __init__(self, config, db, symlink=False):
+        self.config = config
+        self.db = db
+        self.symlink = symlink
+
+        self.template = Template(HTML_TEMPLATE, autoescape=True)
+        self.page_ids = {}
+        self.timeline = OrderedDict()
+
+        self._tg = TelegramFormatter()
+        self._md_parser = commonmark.Parser()
+        self._md_renderer = commonmark.HtmlRenderer()
+
+    # CLI compatibility
+    def load_template(self, fname=None):
+        if fname:
+            with open(fname, "r", encoding="utf-8") as f:
+                self.template = Template(f.read(), autoescape=True)
+
+    def load_rss_template(self, fname=None):
+        pass
+
+    def build(self):
+        self._prepare_output()
+
+        raw_timeline = self.db.get_timeline()
+        self._index_timeline(raw_timeline)
+        self._index_pages(raw_timeline)
+
+        rss_entries = deque([], self.config.get("rss_feed_entries", 50))
+        last_page = None
+
+        for year, months in self.timeline.items():
+            for month in months:
+                last_page = self._render_month(month, rss_entries)
+
+        if last_page:
+            self._write_index(last_page)
+
+        if self.config.get("publish_rss_feed"):
+            self._build_rss(rss_entries)
+
+    def _index_timeline(self, raw_timeline):
+        self.timeline = OrderedDict()
+        for year, months in raw_timeline.items():
+            self.timeline[year] = list(months.values())
+
+    def _index_pages(self, raw_timeline):
+        for year, months in raw_timeline.items():
+            for month in months.values():
+                last_id = 0
+                page = 0
+                while True:
+                    msgs = list(self.db.get_messages(
+                        month.date.year,
+                        month.date.month,
+                        last_id,
+                        self.config["per_page"]
+                    ))
+                    if not msgs:
+                        break
+                    page += 1
+                    fname = self._filename(month, page)
+                    for msg in msgs:
+                        self.page_ids[msg.id] = fname
+                    last_id = msgs[-1].id
+
+    def _render_month(self, month, rss_entries):
+        total = self.db.get_message_count(month.date.year, month.date.month)
+        total_pages = math.ceil(total / self.config["per_page"])
+
+        last_id = 0
+        page = 0
+        last_fname = None
+
+        while True:
+            messages = list(self.db.get_messages(
+                month.date.year,
+                month.date.month,
+                last_id,
+                self.config["per_page"]
+            ))
+            if not messages:
+                break
+
+            page += 1
+            last_id = messages[-1].id
+            fname = self._filename(month, page)
+            last_fname = fname
+
+            if self.config.get("publish_rss_feed"):
+                rss_entries.extend(messages)
+
+            self._render_page(fname, month, messages, page, total_pages)
+
+        return last_fname
+
+    def _render_page(self, fname, month, messages, page, total_pages):
+        html = self.template.render(
+            config=self.config,
+            timeline=self.timeline,
+            month=month,
+            messages=messages,
+            page_ids=self.page_ids,
+            dayline={},
+            pagination={"current": page, "total": total_pages},
+            make_filename=self._filename,
+            render=self._render_message
+        )
+        with open(os.path.join(self.config["publish_dir"], fname), "w", encoding="utf-8") as f:
+            f.write(html)
+
+    def _render_message(self, text):
+        text = self._tg.convert(text)
+        ast = self._md_parser.parse(text)
+        return self._md_renderer.render(ast)
+
+    def _build_rss(self, messages):
+        f = FeedGenerator()
+        f.id(self.config["site_url"])
+        f.title(self.config["site_name"])
+        f.link(href=self.config["site_url"])
+        for m in messages:
+            e = f.add_entry()
+            url = f"{self.config['site_url']}/{self.page_ids.get(m.id)}#{m.id}"
+            e.id(url)
+            e.title(f"@{m.user.username}")
+            e.link({"href": url})
+            e.published(m.date)
+            e.content(self._render_message(m.content), type="html")
+        f.rss_file(os.path.join(self.config["publish_dir"], "index.xml"), pretty=True)
+
+    def _filename(self, month, page):
+        return f"{month.slug}{'_' + str(page) if page > 1 else ''}.html"
+
+    def _write_index(self, fname):
+        shutil.copy(
+            os.path.join(self.config["publish_dir"], fname),
+            os.path.join(self.config["publish_dir"], "index.html")
+        )
+
+    def _prepare_output(self):
+        out = os.path.abspath(self.config["publish_dir"])
+        if os.path.exists(out):
+            shutil.rmtree(out)
+        os.mkdir(out)
+        with open(os.path.join(out, "style.css"), "w", encoding="utf-8") as f:
+            f.write(STYLE_CSS)

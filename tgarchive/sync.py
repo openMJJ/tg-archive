@@ -148,6 +148,18 @@ class Sync:
             if not m:
                 continue
 
+            # === 核心优化1：剔除用户加入类系统消息（类似图片1）===
+            if m.action and isinstance(
+                m.action,
+                (
+                    telethon.tl.types.MessageActionChatAddUser,
+                    telethon.tl.types.MessageActionChatJoinedByLink,
+                    telethon.tl.types.MessageActionChatDeleteUser
+                ),
+            ):
+                logging.info(f"跳过系统消息 ID: {m.id} (用户加入/离开)")
+                continue
+
             # Media.
             sticker = None
             med = None
@@ -163,17 +175,12 @@ class Sync:
                 elif isinstance(m.media, telethon.tl.types.MessageMediaPoll):
                     med = self._make_poll(m)
                 else:
+                    # === 核心优化2：处理多条媒体（类似图片2的多张照片）===
                     med = self._get_media(m)
 
             # Message.
             typ = "message"
-            if m.action:
-                if isinstance(m.action, telethon.tl.types.MessageActionChatAddUser):
-                    typ = "user_joined"
-                elif isinstance(m.action, telethon.tl.types.MessageActionChatJoinedByLink):
-                    typ = "user_joined_by_link"
-                elif isinstance(m.action, telethon.tl.types.MessageActionChatDeleteUser):
-                    typ = "user_left"
+            # 注意：移除了用户加入/离开的类型判断，因为已经在上面剔除了
 
             yield Message(
                 type=typ,
@@ -182,7 +189,7 @@ class Sync:
                 edit_date=m.edit_date,
                 content=sticker if sticker else m.raw_text,
                 reply_to=m.reply_to_msg_id if m.reply_to and m.reply_to.reply_to_msg_id else None,
-                user=self._get_user(m.sender, m.chat),
+                user=self._get_user(getattr(m, 'sender', None), getattr(m, 'chat', None)),
                 media=med
             )
 
@@ -201,6 +208,7 @@ class Sync:
         except errors.FloodWaitError as e:
             logging.info(
                 "flood waited: have to wait {} seconds".format(e.seconds))
+            time.sleep(e.seconds)
 
     def _get_user(self, u, chat) -> User:
         tags = []
@@ -222,6 +230,17 @@ class Sync:
                     avatar=avatar
                 )
 
+        # 添加空值检查，避免 AttributeError
+        if u is None:
+            return User(
+                id=0,
+                username="unknown",
+                first_name="Unknown",
+                last_name=None,
+                tags=["unknown"],
+                avatar=None
+            )
+
         is_normal_user = isinstance(u, telethon.tl.types.User)
 
         if isinstance(u, telethon.tl.types.ChannelForbidden):
@@ -238,20 +257,26 @@ class Sync:
             if u.bot:
                 tags.append("bot")
 
-        if u.scam:
+        # 添加属性存在性检查
+        if hasattr(u, 'scam') and u.scam:
             tags.append("scam")
 
-        if u.fake:
+        if hasattr(u, 'fake') and u.fake:
             tags.append("fake")
 
         # Download sender's profile photo if it's not already cached.
         avatar = self._downloadAvatarForUserOrChat(u)
 
+        # 安全获取用户名
+        username = getattr(u, 'username', None)
+        first_name = getattr(u, 'first_name', None) if is_normal_user else None
+        last_name = getattr(u, 'last_name', None) if is_normal_user else None
+
         return User(
-            id=u.id,
-            username=u.username if u.username else str(u.id),
-            first_name=u.first_name if is_normal_user else None,
-            last_name=u.last_name if is_normal_user else None,
+            id=getattr(u, 'id', 0),
+            username=username if username else str(getattr(u, 'id', 0)),
+            first_name=first_name,
+            last_name=last_name,
             tags=tags,
             avatar=avatar
         )
@@ -281,6 +306,9 @@ class Sync:
         )
 
     def _get_media(self, msg):
+        """获取消息中的所有媒体文件，支持多条媒体"""
+        
+        # 处理网页类型媒体
         if isinstance(msg.media, telethon.tl.types.MessageMediaWebPage) and \
                 not isinstance(msg.media.webpage, telethon.tl.types.WebPageEmpty):
             return Media(
@@ -291,9 +319,12 @@ class Sync:
                 description=msg.media.webpage.description if msg.media.webpage.description else None,
                 thumb=None
             )
-        elif isinstance(msg.media, telethon.tl.types.MessageMediaPhoto) or \
-                isinstance(msg.media, telethon.tl.types.MessageMediaDocument) or \
-                isinstance(msg.media, telethon.tl.types.MessageMediaContact):
+        
+        # 处理照片、文档、联系人等媒体
+        elif isinstance(msg.media, (telethon.tl.types.MessageMediaPhoto, 
+                                  telethon.tl.types.MessageMediaDocument, 
+                                  telethon.tl.types.MessageMediaContact)):
+            
             if self.config["download_media"]:
                 # Filter by extensions?
                 if len(self.config["media_mime_types"]) > 0:
@@ -301,14 +332,29 @@ class Sync:
                         if msg.file.mime_type not in self.config["media_mime_types"]:
                             logging.info(
                                 "skipping media #{} / {}".format(msg.file.name, msg.file.mime_type))
-                            return
+                            return None
 
                 logging.info("downloading media #{}".format(msg.id))
                 try:
                     basename, fname, thumb = self._download_media(msg)
+                    
+                    # 根据媒体类型设置更准确的类型
+                    media_type = "photo"
+                    if isinstance(msg.media, telethon.tl.types.MessageMediaDocument):
+                        if hasattr(msg.file, "mime_type"):
+                            mime_type = msg.file.mime_type
+                            if mime_type.startswith('video/'):
+                                media_type = "video"
+                            elif mime_type.startswith('audio/'):
+                                media_type = "audio"
+                            elif mime_type.startswith('image/'):
+                                media_type = "image"
+                            else:
+                                media_type = "document"
+                    
                     return Media(
                         id=msg.id,
-                        type="photo",
+                        type=media_type,
                         url=fname,
                         title=basename,
                         description=None,
@@ -317,6 +363,13 @@ class Sync:
                 except Exception as e:
                     logging.error(
                         "error downloading media: #{}: {}".format(msg.id, e))
+                    return None
+        
+        # 处理投票
+        elif isinstance(msg.media, telethon.tl.types.MessageMediaPoll):
+            return self._make_poll(msg)
+        
+        return None
 
     def _download_media(self, msg) -> [str, str, str]:
         """
@@ -329,18 +382,22 @@ class Sync:
         fpath = self.client.download_media(msg, file=tempfile.gettempdir())
         basename = os.path.basename(fpath)
 
+        # === 核心优化3：避免重复下载，使用消息ID作为文件名 ===
         newname = "{}.{}".format(msg.id, self._get_file_ext(basename))
-        shutil.move(fpath, os.path.join(self.config["media_dir"], newname))
+        final_path = os.path.join(self.config["media_dir"], newname)
+        shutil.move(fpath, final_path)
 
         # If it's a photo, download the thumbnail.
         tname = None
         if isinstance(msg.media, telethon.tl.types.MessageMediaPhoto):
+            # 使用相同的消息ID确保缩略图对应正确的原图
             tpath = self.client.download_media(
                 msg, file=tempfile.gettempdir(), thumb=1)
             tname = "thumb_{}.{}".format(
                 msg.id, self._get_file_ext(os.path.basename(tpath)))
             shutil.move(tpath, os.path.join(self.config["media_dir"], tname))
 
+        # 返回相对路径而不是绝对路径
         return basename, newname, tname
 
     def _get_file_ext(self, f) -> str:

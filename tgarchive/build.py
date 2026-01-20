@@ -1,225 +1,380 @@
-from collections import OrderedDict, deque
 import logging
 import math
 import os
-import pkg_resources
-import re
 import shutil
-import magic
+import json
+from collections import OrderedDict, deque
+from pathlib import Path
+from typing import Dict
 
+from importlib.metadata import version as pkg_version
+
+import magic
+import commonmark
 from feedgen.feed import FeedGenerator
 from jinja2 import Template
 
 from .db import User, Message
-
-
-_NL2BR = re.compile(r"\n\n+")
+from .telegram_format import TelegramFormatter
 
 
 class Build:
-    config = {}
-    template = None
-    db = None
-
-    def __init__(self, config, db, symlink):
+    def __init__(self, config, db, symlink: bool):
         self.config = config
         self.db = db
         self.symlink = symlink
 
-        self.rss_template: Template = None
+        self.template: Template | None = None
 
-        # Map of all message IDs across all months and the slug of the page
-        # in which they occur (paginated), used to link replies to their
-        # parent messages that may be on arbitrary pages.
-        self.page_ids = {}
-        self.timeline = OrderedDict()
+        self.page_ids: Dict[int, str] = {}
+        self.timeline: OrderedDict[int, list] = OrderedDict()
+        self._mime_cache: Dict[str, str] = {}
+
+        self._tg_formatter = TelegramFormatter()
+        self._md_parser = commonmark.Parser()
+        self._md_renderer = commonmark.HtmlRenderer()
+
+    # ======================================================
+    # Build
+    # ======================================================
 
     def build(self):
-        # (Re)create the output directory.
-        self._create_publish_dir()
+        self._prepare_publish_dir()
 
         timeline = list(self.db.get_timeline())
-        if len(timeline) == 0:
-            logging.info("no data found to publish site")
-            quit()
+        if not timeline:
+            return
 
-        for month in timeline:
-            if month.date.year not in self.timeline:
-                self.timeline[month.date.year] = []
-            self.timeline[month.date.year].append(month)
+        self._build_timeline_index(timeline)
+        self._collect_page_ids(timeline)
 
-        # Queue to store the latest N items to publish in the RSS feed.
         rss_entries = deque([], self.config["rss_feed_entries"])
-        fname = None
-        for month in timeline:
-            # Get the days + message counts for the month.
-            dayline = OrderedDict()
-            for d in self.db.get_dayline(month.date.year, month.date.month, self.config["per_page"]):
-                dayline[d.slug] = d
+        last_rendered = None
 
-            # Paginate and fetch messages for the month until the end..
-            page = 0
-            last_id = 0
-            total = self.db.get_message_count(
-                month.date.year, month.date.month)
+        for month in timeline:
+            dayline = self._get_dayline(month)
+            total = self.db.get_message_count(month.date.year, month.date.month)
             total_pages = math.ceil(total / self.config["per_page"])
 
+            last_id = 0
+            page = 0
             while True:
-                messages = list(self.db.get_messages(month.date.year, month.date.month,
-                                                     last_id, self.config["per_page"]))
-
-                if len(messages) == 0:
+                messages = list(
+                    self.db.get_messages(
+                        month.date.year,
+                        month.date.month,
+                        last_id,
+                        self.config["per_page"],
+                    )
+                )
+                if not messages:
                     break
-
-                last_id = messages[-1].id
 
                 page += 1
                 fname = self.make_filename(month, page)
-
-                # Collect the message ID -> page name for all messages in the set
-                # to link to replies in arbitrary positions across months, paginated pages.
-                for m in messages:
-                    self.page_ids[m.id] = fname
+                last_rendered = fname
+                last_id = messages[-1].id
 
                 if self.config["publish_rss_feed"]:
                     rss_entries.extend(messages)
 
-                self._render_page(messages, month, dayline,
-                                  fname, page, total_pages)
+                self._render_page(
+                    messages=messages,
+                    month=month,
+                    dayline=dayline,
+                    fname=fname,
+                    page=page,
+                    total_pages=total_pages,
+                )
 
-        # The last page chronologically is the latest page. Make it index.
-        if fname:
-            if self.symlink:
-                os.symlink(fname, os.path.join(self.config["publish_dir"], "index.html"))
-            else:
-                shutil.copy(os.path.join(self.config["publish_dir"], fname),
-                            os.path.join(self.config["publish_dir"], "index.html"))
+        self._build_index(last_rendered)
+        self._build_search_index(timeline)
 
-        # Generate RSS feeds.
         if self.config["publish_rss_feed"]:
-            self._build_rss(rss_entries, "index.rss", "index.atom")
+            self._build_rss(rss_entries)
 
-    def load_template(self, fname):
-        with open(fname, "r") as f:
+    # ======================================================
+    # Template
+    # ======================================================
+
+    def load_template(self, fname: str):
+        with open(fname, "r", encoding="utf-8") as f:
             self.template = Template(f.read(), autoescape=True)
 
-    def load_rss_template(self, fname):
-        with open(fname, "r") as f:
-            self.rss_template = Template(f.read(), autoescape=True)
+    # ======================================================
+    # Timeline helpers
+    # ======================================================
 
-    def make_filename(self, month, page) -> str:
-        fname = "{}{}.html".format(
-            month.slug, "_" + str(page) if page > 1 else "")
-        return fname
+    def _build_timeline_index(self, timeline):
+        for m in timeline:
+            self.timeline.setdefault(m.date.year, []).append(m)
 
-    def _render_page(self, messages, month, dayline, fname, page, total_pages):
-        html = self.template.render(config=self.config,
-                                    timeline=self.timeline,
-                                    dayline=dayline,
-                                    month=month,
-                                    messages=messages,
-                                    page_ids=self.page_ids,
-                                    pagination={"current": page,
-                                                "total": total_pages},
-                                    make_filename=self.make_filename,
-                                    nl2br=self._nl2br)
+    def _collect_page_ids(self, timeline):
+        for m in timeline:
+            last_id = 0
+            page = 0
+            while True:
+                msgs = list(
+                    self.db.get_messages(
+                        m.date.year, m.date.month, last_id, self.config["per_page"]
+                    )
+                )
+                if not msgs:
+                    break
+                page += 1
+                fname = self.make_filename(m, page)
+                for msg in msgs:
+                    self.page_ids[msg.id] = fname
+                last_id = msgs[-1].id
 
-        with open(os.path.join(self.config["publish_dir"], fname), "w", encoding="utf8") as f:
-            f.write(html)
+    def _get_dayline(self, month):
+        dayline = OrderedDict()
+        for d in self.db.get_dayline(
+            month.date.year, month.date.month, self.config["per_page"]
+        ):
+            dayline[d.slug] = d
+        return dayline
 
-    def _build_rss(self, messages, rss_file, atom_file):
+    def make_filename(self, month, page: int) -> str:
+        return f"{month.slug}{'_' + str(page) if page > 1 else ''}.html"
+
+    # ======================================================
+    # Rendering
+    # ======================================================
+
+    def _render_page(self, *, messages, month, dayline, fname, page, total_pages):
+        html = self.template.render(
+            config=self.config,
+            timeline=self.timeline,
+            dayline=dayline,
+            month=month,
+            messages=messages,
+            page_ids=self.page_ids,
+            pagination={"current": page, "total": total_pages},
+            make_filename=self.make_filename,
+            nl2br=self._markdown,
+            markdown=self._markdown,
+        )
+
+        html = self._inject_search_ui(html)
+        (Path(self.config["publish_dir"]) / fname).write_text(html, encoding="utf-8")
+
+    def _build_index(self, fname):
+        if not fname:
+            return
+        pub = Path(self.config["publish_dir"])
+        dst = pub / "index.html"
+        if dst.exists():
+            dst.unlink()
+        if self.symlink:
+            dst.symlink_to(fname)
+        else:
+            shutil.copyfile(pub / fname, dst)
+
+    # ======================================================
+    # Search index
+    # ======================================================
+
+    def _build_search_index(self, timeline):
+        records = []
+        for m in timeline:
+            last_id = 0
+            while True:
+                msgs = list(
+                    self.db.get_messages(
+                        m.date.year, m.date.month, last_id, self.config["per_page"]
+                    )
+                )
+                if not msgs:
+                    break
+                for msg in msgs:
+                    raw = (msg.content or "").strip()
+                    if not raw:
+                        continue
+                    records.append(
+                        {
+                            "id": msg.id,
+                            "user": msg.user.username if msg.user else "",
+                            "date": msg.date.isoformat(),
+                            "text": raw,
+                            "html": self._markdown(raw),
+                            "url": f"{self.page_ids[msg.id]}#{msg.id}",
+                        }
+                    )
+                last_id = msgs[-1].id
+
+        (Path(self.config["publish_dir"]) / "search.json").write_text(
+            json.dumps(records, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    # ======================================================
+    # Search UI（完全保持你给的版本）
+    # ======================================================
+
+    def _inject_search_ui(self, html: str) -> str:
+        if "</body>" not in html:
+            return html
+        return html.replace("</body>", self._search_ui_block() + "\n</body>")
+
+    def _search_ui_block(self) -> str:
+        return r"""
+<style>
+#search-btn{position:fixed;right:24px;bottom:24px;width:52px;height:52px;
+border-radius:50%;background:#38bdf8;color:#020617;display:flex;
+align-items:center;justify-content:center;font-size:24px;cursor:pointer;
+z-index:9998}
+#search-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);
+backdrop-filter:blur(6px);z-index:9999;display:none;
+align-items:flex-start;justify-content:center;padding-top:8vh}
+#search-overlay.active{display:flex}
+#search-dialog{width:min(920px,96vw);background:#020617;
+border:1px solid #1e293b;border-radius:14px;overflow:hidden}
+#search-input{width:100%;padding:18px;font-size:17px;border:none;
+outline:none;background:#020617;color:#f8fafc;
+border-bottom:1px solid #1e293b}
+#search-results{max-height:70vh;overflow-y:auto;padding:8px}
+.search-item{background:#020617;border:1px solid #1e293b;
+border-radius:10px;padding:18px 20px;margin-bottom:12px}
+.search-user{font-size:13px;color:#7dd3fc;margin-bottom:10px}
+.search-text{font-size:16px;line-height:1.75;color:#f8fafc}
+.search-text p{margin:0 0 1em 0}
+mark.search-hit{background:#fde047;color:#020617;
+padding:0 3px;border-radius:4px}
+</style>
+
+<div id="search-btn">🔍</div>
+
+<div id="search-overlay">
+  <div id="search-dialog">
+    <input id="search-input" type="search" placeholder="搜索消息…" />
+    <div id="search-results"></div>
+  </div>
+</div>
+
+<script>
+let DATA=null;
+
+function highlight(html,q){
+  if(!q) return html;
+  const re=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"gi");
+  return html.replace(re,m=>`<mark class="search-hit">${m}</mark>`);
+}
+
+async function loadData(){
+  if(DATA) return DATA;
+  const r=await fetch("/search.json");
+  DATA=await r.json();
+  return DATA;
+}
+
+function openSearch(){
+  document.getElementById("search-overlay").classList.add("active");
+  const i=document.getElementById("search-input");
+  i.value="";i.focus();
+}
+
+function closeSearch(){
+  document.getElementById("search-overlay").classList.remove("active");
+}
+
+document.getElementById("search-btn").onclick=openSearch;
+
+document.addEventListener("keydown",e=>{
+  if(e.key==="/"&&!e.target.matches("input,textarea")){
+    e.preventDefault();openSearch();
+  }
+  if(e.key==="Escape")closeSearch();
+});
+
+document.getElementById("search-input").addEventListener("input",async e=>{
+  const q=e.target.value.trim();
+  const box=document.getElementById("search-results");
+  box.innerHTML="";
+  if(!q) return;
+  const data=await loadData();
+  let n=0;
+  for(const m of data){
+    if(m.text.toLowerCase().includes(q.toLowerCase())){
+      const d=document.createElement("div");
+      d.className="search-item";
+      d.innerHTML=`<div class="search-user">@${m.user} · ${m.date}</div>
+                   <div class="search-text">${highlight(m.html,q)}</div>`;
+      d.onclick=()=>location.href=m.url;
+      box.appendChild(d);
+      if(++n>=50) break;
+    }
+  }
+});
+</script>
+"""
+
+    # ======================================================
+    # RSS
+    # ======================================================
+
+    def _build_rss(self, messages):
         f = FeedGenerator()
         f.id(self.config["site_url"])
-        f.generator(
-            "tg-archive {}".format(pkg_resources.get_distribution("tg-archive").version))
+        f.generator(f"tg-archive {pkg_version('tg-archive')}")
         f.link(href=self.config["site_url"], rel="alternate")
         f.title(self.config["site_name"].format(group=self.config["group"]))
         f.subtitle(self.config["site_description"])
-
         for m in messages:
-            url = "{}/{}#{}".format(self.config["site_url"],
-                                    self.page_ids[m.id], m.id)
-            e = f.add_entry()
-            e.id(url)
-            e.title("@{} on {} (#{})".format(m.user.username, m.date, m.id))
-            e.link({"href": url})
-            e.published(m.date)
-
-            media_mime = ""
-            if m.media and m.media.url:
-                murl = "{}/{}/{}".format(self.config["site_url"],
-                                         os.path.basename(self.config["media_dir"]), m.media.url)
-                media_path = "{}/{}".format(self.config["media_dir"], m.media.url)
-                media_mime = "application/octet-stream"
-                media_size = 0
-
-                if "://" in media_path:
-                    media_mime = "text/html"
-                else:
-                    try:
-                        media_size = str(os.path.getsize(media_path))
-                        try:
-                            media_mime = magic.from_file(media_path, mime=True)
-                        except:
-                            pass
-                    except FileNotFoundError:
-                        pass
-
-                e.enclosure(murl, media_size, media_mime)
-            e.content(self._make_abstract(m, media_mime), type="html")
-
-        f.rss_file(os.path.join(self.config["publish_dir"], "index.xml"), pretty=True)
-        f.atom_file(os.path.join(self.config["publish_dir"], "index.atom"), pretty=True)
-
-    def _make_abstract(self, m, media_mime):
-        if self.rss_template:
-            return self.rss_template.render(config=self.config,
-                                            m=m,
-                                            media_mime=media_mime,
-                                            page_ids=self.page_ids,
-                                            nl2br=self._nl2br)
-        out = m.content
-        if not out and m.media:
-            out = m.media.title
-        return out if out else ""
-
-    def _nl2br(self, s) -> str:
-        # There has to be a \n before <br> so as to not break
-        # Jinja's automatic hyperlinking of URLs.
-        return _NL2BR.sub("\n\n", s).replace("\n", "\n<br />")
-
-    def _create_publish_dir(self):
+            self._add_rss_entry(f, m)
         pubdir = self.config["publish_dir"]
+        f.rss_file(os.path.join(pubdir, "index.xml"), pretty=True)
+        f.atom_file(os.path.join(pubdir, "index.atom"), pretty=True)
 
-        # Clear the output directory.
-        if os.path.exists(pubdir):
+    def _add_rss_entry(self, feed, m: Message):
+    # 使用 m 代替 msg
+        url = f"{self.config['site_url']}/{self.page_ids[m.id]}#{m.id}"  # 修改这里的 'msg' 为 'm'
+        e = feed.add_entry()
+        e.id(url)
+        e.title(f"@{m.user.username} · {m.date}")
+        e.link({"href": url})
+        e.published(m.date)
+        e.content(self._markdown(m.content or ""), type="html")
+
+    # ======================================================
+    # Markdown
+    # ======================================================
+
+    def _markdown(self, text: str) -> str:
+        if not text:
+            return ""
+        text = self._tg_formatter.convert(text)
+        ast = self._md_parser.parse(text)
+        return self._md_renderer.render(ast)
+
+    # ======================================================
+    # Filesystem（关键修复）
+    # ======================================================
+
+    def _prepare_publish_dir(self):
+        pubdir = Path(self.config["publish_dir"]).resolve()
+        if pubdir.exists():
             shutil.rmtree(pubdir)
+        pubdir.mkdir()
+        self._copy_static(pubdir)
+        self._copy_media(pubdir)
 
-        # Re-create the output directory.
-        os.mkdir(pubdir)
+    def _copy_static(self, pubdir: Path):
+        static = Path(self.config["static_dir"])
+        target = pubdir / static.name
+        if self.symlink:
+            target.symlink_to(os.path.relpath(static.resolve(), pubdir))
+        elif static.is_file():
+            shutil.copyfile(static, target)
+        else:
+            shutil.copytree(static, target)
 
-        # Copy the static directory into the output directory.
-        for f in [self.config["static_dir"]]:
-            target = os.path.join(pubdir, f)
-            if self.symlink:
-                self._relative_symlink(os.path.abspath(f), target)
-            elif os.path.isfile(f):
-                shutil.copyfile(f, target)
-            else:
-                shutil.copytree(f, target)
-
-        # If media downloading is enabled, copy/symlink the media directory.
-        mediadir = self.config["media_dir"]
-        if os.path.exists(mediadir):
-            if self.symlink:
-                self._relative_symlink(os.path.abspath(mediadir), os.path.join(
-                    pubdir, os.path.basename(mediadir)))
-            else:
-                shutil.copytree(mediadir, os.path.join(
-                    pubdir, os.path.basename(mediadir)))
-
-    def _relative_symlink(self, src, dst):
-        dir_path = os.path.dirname(dst)
-        src = os.path.relpath(src, dir_path)
-        dst = os.path.join(dir_path, os.path.basename(src))
-        return os.symlink(src, dst)
+    def _copy_media(self, pubdir: Path):
+        mediadir = Path(self.config["media_dir"])
+        if not mediadir.exists():
+            return
+        target = pubdir / mediadir.name
+        if self.symlink:
+            target.symlink_to(os.path.relpath(mediadir.resolve(), pubdir))
+        else:
+            shutil.copytree(mediadir, target)
