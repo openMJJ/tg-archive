@@ -10,6 +10,7 @@ import time
 from PIL import Image
 from telethon import TelegramClient, errors, sync
 import telethon.tl.types
+from telethon.extensions import markdown  # 引入 markdown 用于保留超链接格式
 
 from .db import User, Message, Media
 
@@ -141,6 +142,26 @@ class Sync:
     def finish_takeout(self):
         self.client.__exit__(None, None, None)
 
+    def _parse_content(self, m):
+        """
+        核心优化：解析消息内容，保留超链接和格式。
+        将消息实体转换为 Markdown 格式，例如 [Text](URL)。
+        """
+        if not m.raw_text:
+            return ""
+        
+        # 如果是贴纸，通常没有文本内容，由调用方处理
+        # 这里只处理文本消息的格式化
+        try:
+            if m.entities:
+                # 使用 telethon 内置的 markdown unparse 功能保留格式
+                return markdown.unparse(m.message, m.entities)
+            else:
+                return m.raw_text
+        except Exception as e:
+            logging.warning(f"Error parsing markdown for msg {m.id}: {e}")
+            return m.raw_text
+
     def _get_messages(self, group, offset_id, ids=None) -> Message:
         messages = self._fetch_messages(group, offset_id, ids)
         # https://docs.telethon.dev/en/latest/quick-references/objects-reference.html#message
@@ -148,7 +169,7 @@ class Sync:
             if not m:
                 continue
 
-            # === 核心优化1：剔除用户加入类系统消息（类似图片1）===
+            # === 核心优化1：剔除用户加入类系统消息 ===
             if m.action and isinstance(
                 m.action,
                 (
@@ -175,19 +196,21 @@ class Sync:
                 elif isinstance(m.media, telethon.tl.types.MessageMediaPoll):
                     med = self._make_poll(m)
                 else:
-                    # === 核心优化2：处理多条媒体（类似图片2的多张照片）===
+                    # === 核心优化2：处理多条媒体 ===
                     med = self._get_media(m)
 
             # Message.
             typ = "message"
-            # 注意：移除了用户加入/离开的类型判断，因为已经在上面剔除了
+            
+            # === 核心优化：获取带格式的内容（超链接） ===
+            content_text = sticker if sticker else self._parse_content(m)
 
             yield Message(
                 type=typ,
                 id=m.id,
                 date=m.date,
                 edit_date=m.edit_date,
-                content=sticker if sticker else m.raw_text,
+                content=content_text,
                 reply_to=m.reply_to_msg_id if m.reply_to and m.reply_to.reply_to_msg_id else None,
                 user=self._get_user(getattr(m, 'sender', None), getattr(m, 'chat', None)),
                 media=med
@@ -230,7 +253,6 @@ class Sync:
                     avatar=avatar
                 )
 
-        # 添加空值检查，避免 AttributeError
         if u is None:
             return User(
                 id=0,
@@ -257,7 +279,6 @@ class Sync:
             if u.bot:
                 tags.append("bot")
 
-        # 添加属性存在性检查
         if hasattr(u, 'scam') and u.scam:
             tags.append("scam")
 
@@ -267,7 +288,6 @@ class Sync:
         # Download sender's profile photo if it's not already cached.
         avatar = self._downloadAvatarForUserOrChat(u)
 
-        # 安全获取用户名
         username = getattr(u, 'username', None)
         first_name = getattr(u, 'first_name', None) if is_normal_user else None
         last_name = getattr(u, 'last_name', None) if is_normal_user else None
@@ -338,7 +358,6 @@ class Sync:
                 try:
                     basename, fname, thumb = self._download_media(msg)
                     
-                    # 根据媒体类型设置更准确的类型
                     media_type = "photo"
                     if isinstance(msg.media, telethon.tl.types.MessageMediaDocument):
                         if hasattr(msg.file, "mime_type"):
@@ -376,9 +395,6 @@ class Sync:
         Download a media / file attached to a message and return its original
         filename, sanitized name on disk, and the thumbnail (if any). 
         """
-        # Download the media to the temp dir and copy it back as
-        # there does not seem to be a way to get the canonical
-        # filename before the download.
         fpath = self.client.download_media(msg, file=tempfile.gettempdir())
         basename = os.path.basename(fpath)
 
@@ -390,14 +406,12 @@ class Sync:
         # If it's a photo, download the thumbnail.
         tname = None
         if isinstance(msg.media, telethon.tl.types.MessageMediaPhoto):
-            # 使用相同的消息ID确保缩略图对应正确的原图
             tpath = self.client.download_media(
                 msg, file=tempfile.gettempdir(), thumb=1)
             tname = "thumb_{}.{}".format(
                 msg.id, self._get_file_ext(os.path.basename(tpath)))
             shutil.move(tpath, os.path.join(self.config["media_dir"], tname))
 
-        # 返回相对路径而不是绝对路径
         return basename, newname, tname
 
     def _get_file_ext(self, f) -> str:
@@ -417,7 +431,6 @@ class Sync:
 
         logging.info("downloading avatar #{}".format(user.id))
 
-        # Download the file into a container, resize it, and then write to disk.
         b = BytesIO()
         profile_photo = self.client.download_profile_photo(user, file=b)
         if profile_photo is None:
@@ -434,20 +447,12 @@ class Sync:
         """
         Syncs the Entity cache and returns the Entity ID for the specified group,
         which can be a str/int for group ID, group name, or a group username.
-
-        The authorized user must be a part of the group.
         """
-        # Get all dialogs for the authorized user, which also
-        # syncs the entity cache to get latest entities
-        # ref: https://docs.telethon.dev/en/latest/concepts/entities.html#getting-entities
         _ = self.client.get_dialogs()
 
         try:
-            # If the passed group is a group ID, extract it.
             group = int(group)
         except ValueError:
-            # Not a group ID, we have either a group name or
-            # a group username: @group-username
             pass
 
         try:
@@ -455,7 +460,6 @@ class Sync:
         except ValueError:
             logging.critical("the group: {} does not exist,"
                              " or the authorized user is not a participant!".format(group))
-            # This is a critical error, so exit with code: 1
             exit(1)
 
         return entity.id
