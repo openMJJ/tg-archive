@@ -5,10 +5,11 @@ import shutil
 import json
 from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Any
 
 from importlib.metadata import version as pkg_version
 
+# 即使没显式用到 magic，为了兼容旧配置保留导入
 import magic
 import commonmark
 from feedgen.feed import FeedGenerator
@@ -26,7 +27,11 @@ class Build:
 
         self.template: Template | None = None
 
+        # 存储消息 ID -> 页面文件名
         self.page_ids: Dict[int, str] = {}
+        # 存储 日期 Slug (YYYY-MM-DD) -> 该日期首次出现的页面文件名
+        self.day_to_page: Dict[str, str] = {}
+        
         self.timeline: OrderedDict[int, list] = OrderedDict()
         self._mime_cache: Dict[str, str] = {}
 
@@ -41,11 +46,15 @@ class Build:
     def build(self):
         self._prepare_publish_dir()
 
+        # 获取完整的时间线（月份列表）
         timeline = list(self.db.get_timeline())
         if not timeline:
             return
 
         self._build_timeline_index(timeline)
+        
+        # [关键步骤] 预先扫描所有消息，建立 消息ID 和 日期 到 文件名 的索引
+        # 这确保了后续渲染时，无论在哪一页，日期的链接都能指向正确的文件
         self._collect_page_ids(timeline)
 
         rss_entries = deque([], self.config["rss_feed_entries"])
@@ -58,6 +67,7 @@ class Build:
 
             last_id = 0
             page = 0
+            
             while True:
                 messages = list(
                     self.db.get_messages(
@@ -110,6 +120,12 @@ class Build:
             self.timeline.setdefault(m.date.year, []).append(m)
 
     def _collect_page_ids(self, timeline):
+        """
+        核心逻辑修复：
+        遍历所有消息，记录：
+        1. 每条消息 ID 对应的文件名。
+        2. 每个日期（YYYY-MM-DD）*第一次* 出现时的文件名。
+        """
         for m in timeline:
             last_id = 0
             page = 0
@@ -121,10 +137,25 @@ class Build:
                 )
                 if not msgs:
                     break
+                
                 page += 1
                 fname = self.make_filename(m, page)
+                
                 for msg in msgs:
                     self.page_ids[msg.id] = fname
+                    
+                    # 获取日期的 slug (YYYY-MM-DD)
+                    # 兼容 datetime 对象或字符串
+                    try:
+                        date_slug = msg.date.strftime("%Y-%m-%d")
+                    except AttributeError:
+                        date_slug = str(msg.date)[:10]
+
+                    # [关键] 只有当该日期从未被记录过时，才记录当前文件名。
+                    # 这保证了链接永远指向该日期 *开始* 的那一页（通常是较早的页码）。
+                    if date_slug not in self.day_to_page:
+                        self.day_to_page[date_slug] = fname
+
                 last_id = msgs[-1].id
 
     def _get_dayline(self, month):
@@ -136,6 +167,7 @@ class Build:
         return dayline
 
     def make_filename(self, month, page: int) -> str:
+        # 页面命名规则：第一页为 2025-12.html，后续为 2025-12_2.html
         return f"{month.slug}{'_' + str(page) if page > 1 else ''}.html"
 
     # ======================================================
@@ -143,6 +175,8 @@ class Build:
     # ======================================================
 
     def _render_page(self, *, messages, month, dayline, fname, page, total_pages):
+        # 将 day_to_page 传入模板
+        # 模板中应使用: day_to_page.get(d.slug) 来获取链接
         html = self.template.render(
             config=self.config,
             timeline=self.timeline,
@@ -150,6 +184,7 @@ class Build:
             month=month,
             messages=messages,
             page_ids=self.page_ids,
+            day_to_page=self.day_to_page,
             pagination={"current": page, "total": total_pages},
             make_filename=self.make_filename,
             nl2br=self._markdown,
@@ -191,6 +226,10 @@ class Build:
                     raw = (msg.content or "").strip()
                     if not raw:
                         continue
+                    
+                    # 确保搜索结果的跳转链接也是准确的
+                    msg_url = f"{self.page_ids.get(msg.id, '')}#{msg.id}"
+                    
                     records.append(
                         {
                             "id": msg.id,
@@ -198,7 +237,7 @@ class Build:
                             "date": msg.date.isoformat(),
                             "text": raw,
                             "html": self._markdown(raw),
-                            "url": f"{self.page_ids[msg.id]}#{msg.id}",
+                            "url": msg_url,
                         }
                     )
                 last_id = msgs[-1].id
@@ -209,7 +248,7 @@ class Build:
         )
 
     # ======================================================
-    # Search UI（完全保持你给的版本）
+    # Search UI
     # ======================================================
 
     def _inject_search_ui(self, html: str) -> str:
@@ -218,6 +257,7 @@ class Build:
         return html.replace("</body>", self._search_ui_block() + "\n</body>")
 
     def _search_ui_block(self) -> str:
+        # 保持你的搜索 UI 代码不变
         return r"""
 <style>
 #search-btn{position:fixed;right:24px;bottom:24px;width:52px;height:52px;
@@ -327,8 +367,10 @@ document.getElementById("search-input").addEventListener("input",async e=>{
         f.atom_file(os.path.join(pubdir, "index.atom"), pretty=True)
 
     def _add_rss_entry(self, feed, m: Message):
-    # 使用 m 代替 msg
-        url = f"{self.config['site_url']}/{self.page_ids[m.id]}#{m.id}"  # 修改这里的 'msg' 为 'm'
+        # 确保 RSS 链接也使用正确的 page_ids 映射
+        fname = self.page_ids.get(m.id, "")
+        url = f"{self.config['site_url']}/{fname}#{m.id}"
+        
         e = feed.add_entry()
         e.id(url)
         e.title(f"@{m.user.username} · {m.date}")
@@ -348,7 +390,7 @@ document.getElementById("search-input").addEventListener("input",async e=>{
         return self._md_renderer.render(ast)
 
     # ======================================================
-    # Filesystem（关键修复）
+    # Filesystem
     # ======================================================
 
     def _prepare_publish_dir(self):
