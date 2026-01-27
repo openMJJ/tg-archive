@@ -54,7 +54,6 @@ class Build:
         self._build_timeline_index(timeline)
         
         # [关键步骤] 预先扫描所有消息，建立 消息ID 和 日期 到 文件名 的索引
-        # 这确保了后续渲染时，无论在哪一页，日期的链接都能指向正确的文件
         self._collect_page_ids(timeline)
 
         rss_entries = deque([], self.config["rss_feed_entries"])
@@ -121,10 +120,7 @@ class Build:
 
     def _collect_page_ids(self, timeline):
         """
-        核心逻辑修复：
-        遍历所有消息，记录：
-        1. 每条消息 ID 对应的文件名。
-        2. 每个日期（YYYY-MM-DD）*第一次* 出现时的文件名。
+        遍历所有消息，记录消息ID和日期对应的文件名。
         """
         for m in timeline:
             last_id = 0
@@ -144,15 +140,11 @@ class Build:
                 for msg in msgs:
                     self.page_ids[msg.id] = fname
                     
-                    # 获取日期的 slug (YYYY-MM-DD)
-                    # 兼容 datetime 对象或字符串
                     try:
                         date_slug = msg.date.strftime("%Y-%m-%d")
                     except AttributeError:
                         date_slug = str(msg.date)[:10]
 
-                    # [关键] 只有当该日期从未被记录过时，才记录当前文件名。
-                    # 这保证了链接永远指向该日期 *开始* 的那一页（通常是较早的页码）。
                     if date_slug not in self.day_to_page:
                         self.day_to_page[date_slug] = fname
 
@@ -167,7 +159,6 @@ class Build:
         return dayline
 
     def make_filename(self, month, page: int) -> str:
-        # 页面命名规则：第一页为 2025-12.html，后续为 2025-12_2.html
         return f"{month.slug}{'_' + str(page) if page > 1 else ''}.html"
 
     # ======================================================
@@ -175,8 +166,6 @@ class Build:
     # ======================================================
 
     def _render_page(self, *, messages, month, dayline, fname, page, total_pages):
-        # 将 day_to_page 传入模板
-        # 模板中应使用: day_to_page.get(d.slug) 来获取链接
         html = self.template.render(
             config=self.config,
             timeline=self.timeline,
@@ -227,7 +216,6 @@ class Build:
                     if not raw:
                         continue
                     
-                    # 确保搜索结果的跳转链接也是准确的
                     msg_url = f"{self.page_ids.get(msg.id, '')}#{msg.id}"
                     
                     records.append(
@@ -248,7 +236,7 @@ class Build:
         )
 
     # ======================================================
-    # Search UI
+    # Search UI (Fixed)
     # ======================================================
 
     def _inject_search_ui(self, html: str) -> str:
@@ -257,7 +245,10 @@ class Build:
         return html.replace("</body>", self._search_ui_block() + "\n</body>")
 
     def _search_ui_block(self) -> str:
-        # 保持你的搜索 UI 代码不变
+        # 修复说明：
+        # 1. 将 fetch("/search.json") 改为 fetch("search.json") 以支持子目录部署。
+        # 2. 将 if(++n>=50) 改为 if(++n>=500)，大幅增加结果显示数量。
+        # 3. 在显示时使用 m.text 而不是 m.html，避免关键词匹配破坏 HTML 标签结构导致显示不全。
         return r"""
 <style>
 #search-btn{position:fixed;right:24px;bottom:24px;width:52px;height:52px;
@@ -275,7 +266,8 @@ outline:none;background:#020617;color:#f8fafc;
 border-bottom:1px solid #1e293b}
 #search-results{max-height:70vh;overflow-y:auto;padding:8px}
 .search-item{background:#020617;border:1px solid #1e293b;
-border-radius:10px;padding:18px 20px;margin-bottom:12px}
+border-radius:10px;padding:18px 20px;margin-bottom:12px;cursor:pointer}
+.search-item:hover{background:#0f172a}
 .search-user{font-size:13px;color:#7dd3fc;margin-bottom:10px}
 .search-text{font-size:16px;line-height:1.75;color:#f8fafc}
 .search-text p{margin:0 0 1em 0}
@@ -295,15 +287,17 @@ padding:0 3px;border-radius:4px}
 <script>
 let DATA=null;
 
-function highlight(html,q){
-  if(!q) return html;
+function highlight(text,q){
+  if(!q) return text;
+  // 简单的文本替换，不涉及HTML标签，保证安全
   const re=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"gi");
-  return html.replace(re,m=>`<mark class="search-hit">${m}</mark>`);
+  return text.replace(re,m=>`<mark class="search-hit">${m}</mark>`);
 }
 
 async function loadData(){
   if(DATA) return DATA;
-  const r=await fetch("/search.json");
+  // 修复：使用相对路径
+  const r=await fetch("search.json");
   DATA=await r.json();
   return DATA;
 }
@@ -312,6 +306,7 @@ function openSearch(){
   document.getElementById("search-overlay").classList.add("active");
   const i=document.getElementById("search-input");
   i.value="";i.focus();
+  loadData(); // 预加载
 }
 
 function closeSearch(){
@@ -332,17 +327,26 @@ document.getElementById("search-input").addEventListener("input",async e=>{
   const box=document.getElementById("search-results");
   box.innerHTML="";
   if(!q) return;
+  
   const data=await loadData();
   let n=0;
   for(const m of data){
+    // 搜索纯文本内容
     if(m.text.toLowerCase().includes(q.toLowerCase())){
       const d=document.createElement("div");
       d.className="search-item";
-      d.innerHTML=`<div class="search-user">@${m.user} · ${m.date}</div>
-                   <div class="search-text">${highlight(m.html,q)}</div>`;
+      
+      // 修复：展示 text 并处理换行，避免 highlight 破坏 m.html 中的标签
+      const safeText = m.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const displayText = highlight(safeText, q).replace(/\n/g, '<br>');
+
+      d.innerHTML=`<div class="search-user">@${m.user} · ${m.date.split("T")[0]}</div>
+                   <div class="search-text">${displayText}</div>`;
       d.onclick=()=>location.href=m.url;
       box.appendChild(d);
-      if(++n>=50) break;
+      
+      // 修复：将显示限制从 50 提升到 500
+      if(++n>=500) break;
     }
   }
 });
@@ -367,7 +371,6 @@ document.getElementById("search-input").addEventListener("input",async e=>{
         f.atom_file(os.path.join(pubdir, "index.atom"), pretty=True)
 
     def _add_rss_entry(self, feed, m: Message):
-        # 确保 RSS 链接也使用正确的 page_ids 映射
         fname = self.page_ids.get(m.id, "")
         url = f"{self.config['site_url']}/{fname}#{m.id}"
         
